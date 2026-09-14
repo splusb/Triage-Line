@@ -40,6 +40,10 @@ export interface NodeSnapshot {
   attemptedLocales?: string[];
   /** Why a consequential call was proposed (shown at the approval gate). */
   proposedReason?: string;
+  /** This call must be authorized by a human before it dials. */
+  requiresApproval?: boolean;
+  /** Whether a human has authorized it. */
+  approved?: boolean;
 }
 
 export interface RunSnapshot {
@@ -56,7 +60,7 @@ export interface RunSnapshot {
 /** A serialized event pushed to SSE clients. */
 export interface RunEvent {
   seq: number;
-  type: ExecutorEvent["type"] | "snapshot" | "node_approved";
+  type: ExecutorEvent["type"] | "snapshot" | "node_approved" | "run_paused";
   nodeId?: string;
   from?: string;
   to?: string;
@@ -68,18 +72,28 @@ export interface RunEvent {
 type Listener = (event: RunEvent) => void;
 
 /**
- * Redact phone-like values from a structured result before it's serialized.
- * Provider-discovered numbers (e.g. referral_phone) must never leak in full.
+ * Deeply redact phone-like values anywhere in a JSON value (strings, nested
+ * objects, arrays). Provider-discovered numbers (e.g. a nested referral_phone)
+ * must never leak in full at any depth.
  */
+function redactDeep(value: unknown): unknown {
+  if (typeof value === "string") return redactPhones(value);
+  if (Array.isArray(value)) return value.map(redactDeep);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = redactDeep(v);
+    }
+    return out;
+  }
+  return value;
+}
+
 function redactResult(
   result: Record<string, unknown> | undefined
 ): Record<string, unknown> | undefined {
   if (!result) return undefined;
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(result)) {
-    out[k] = typeof v === "string" ? redactPhones(v) : v;
-  }
-  return out;
+  return redactDeep(result) as Record<string, unknown>;
 }
 
 function snapshotNode(n: CallNode): NodeSnapshot {
@@ -105,14 +119,17 @@ function snapshotNode(n: CallNode): NodeSnapshot {
       ? {
           trusted: n.verification.trusted,
           status: n.verification.status,
-          notes: n.verification.notes,
-          policyFlags: n.verification.policyFlags,
+          // Notes/flags are human-facing text and can contain numbers.
+          notes: n.verification.notes.map((s) => redactPhones(s)),
+          policyFlags: n.verification.policyFlags.map((s) => redactPhones(s)),
         }
       : undefined,
     attemptedLocales: n.attemptedLocales,
     proposedReason: n.proposedReason
       ? redactPhones(n.proposedReason)
       : undefined,
+    requiresApproval: n.requiresApproval,
+    approved: n.approved,
   };
 }
 
@@ -147,7 +164,8 @@ class Run {
       startedAt: this.startedAt,
       finishedAt: this.finishedAt,
       nodes: this.graph.nodes.map(snapshotNode),
-      error: this.error,
+      // Error text can include a number (e.g. a failed E.164) — mask it.
+      error: this.error ? redactPhones(this.error) : undefined,
     };
   }
 
@@ -280,12 +298,21 @@ class Run {
       const parked = this.graph.nodes.some(
         (n) => n.status === "awaiting_approval"
       );
-      this.state = parked ? "running" : "done";
+      this.executing = false;
+      if (parked) {
+        // Do NOT signal graph_done while paused — the client keeps the SSE
+        // stream open so it receives events when a human approval resumes it.
+        this.state = "running";
+        this.emit({ type: "run_paused" });
+      } else {
+        this.state = "done";
+        this.finishedAt = Date.now();
+        this.emit({ type: "graph_done" });
+      }
     } catch (err) {
+      this.executing = false;
       this.state = "error";
       this.error = err instanceof Error ? err.message : String(err);
-    } finally {
-      this.executing = false;
       this.finishedAt = Date.now();
       this.emit({ type: "graph_done" });
     }
