@@ -59,8 +59,14 @@ function currentMode(): Mode {
   return useMock ? "mock" : "live";
 }
 
-/** Host to bind. Live/hybrid are only allowed on loopback. */
-const HOST = process.env.HOST ?? "127.0.0.1";
+/**
+ * Host to bind. Defaults to 0.0.0.0 so a mock (no-call) demo can be hosted on
+ * platforms that require binding all interfaces (e.g. Render). This is safe in
+ * mock mode, which places no real calls. Live/hybrid modes are separately
+ * refused unless bound to loopback (see makeClient), so a public deploy can
+ * never place real calls regardless of this default.
+ */
+const HOST = process.env.HOST ?? "0.0.0.0";
 
 function isLoopbackHost(host: string): boolean {
   return host === "127.0.0.1" || host === "::1" || host === "localhost";
